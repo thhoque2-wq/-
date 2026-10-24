@@ -1,0 +1,2079 @@
+name: Build Screen Recorder Pro APK
+
+# How to use: put this file at .github/workflows/build-screen-recorder.yml in a GitHub repo,
+# push it, then open the Actions tab. The APK appears under Artifacts and under Releases.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Accept Android licenses and install platform
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Generate project files
+        run: |
+          mkdir -p ScreenRecorderPro ScreenRecorderPro/app ScreenRecorderPro/app/src/main ScreenRecorderPro/app/src/main/java/com/hiddeninfo/screenrecorder ScreenRecorderPro/app/src/main/res/drawable ScreenRecorderPro/app/src/main/res/mipmap-anydpi-v26 ScreenRecorderPro/app/src/main/res/values
+          cat > ScreenRecorderPro/app/build.gradle.kts <<'KTEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.hiddeninfo.screenrecorder"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.hiddeninfo.screenrecorder"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+              }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.1")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/AndroidManifest.xml <<'KTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.App">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".RecorderService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection|microphone" />
+              </application>
+          </manifest>
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/java/com/hiddeninfo/screenrecorder/MainActivity.kt <<'KTEOF'
+          package com.hiddeninfo.screenrecorder
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+
+          class MainActivity : ComponentActivity() {
+
+              private var settings by mutableStateOf(RecSettings())
+              private var hideWhenStarted = false
+
+              private val projLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  val d = r.data
+                  if (r.resultCode == RESULT_OK && d != null) {
+                      launchService(r.resultCode, d)
+                  } else {
+                      Toast.makeText(
+                          this,
+                          tr(settings.bengali, "Screen capture permission denied", "স্ক্রিন ক্যাপচার পারমিশন দেওয়া হয়নি"),
+                          Toast.LENGTH_SHORT
+                      ).show()
+                  }
+              }
+
+              private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+                  requestProjection()
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  settings = Prefs.load(this)
+                  setContent {
+                      AppTheme {
+                          LaunchedEffect(RecState.recording) {
+                              if (RecState.recording && hideWhenStarted) {
+                                  hideWhenStarted = false
+                                  moveTaskToBack(true)
+                              }
+                          }
+                          Root(
+                              s = settings,
+                              onSettings = { settings = it; Prefs.save(this@MainActivity, it) },
+                              onRecord = { startFlow() },
+                              onPauseResume = {
+                                  sendAction(if (RecState.paused) RecorderService.ACTION_RESUME else RecorderService.ACTION_PAUSE)
+                              },
+                              onStop = { sendAction(RecorderService.ACTION_STOP) },
+                              onCancel = { sendAction(RecorderService.ACTION_STOP) }
+                          )
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  RecState.libraryVersion = RecState.libraryVersion + 1
+              }
+
+              private fun startFlow() {
+                  if (RecState.recording || RecState.countdown > 0) return
+                  val need = ArrayList<String>()
+                  if (settings.audio != 0 &&
+                      checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+                  ) need.add(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (need.isNotEmpty()) permLauncher.launch(need.toTypedArray()) else requestProjection()
+              }
+
+              private fun requestProjection() {
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projLauncher.launch(mpm.createScreenCaptureIntent())
+              }
+
+              private fun launchService(code: Int, data: Intent) {
+                  val i = Intent(this, RecorderService::class.java)
+                  i.action = RecorderService.ACTION_START
+                  i.putExtra(RecorderService.EXTRA_CODE, code)
+                  i.putExtra(RecorderService.EXTRA_DATA, data)
+                  hideWhenStarted = true
+                  startForegroundService(i)
+              }
+
+              private fun sendAction(action: String) {
+                  try {
+                      val i = Intent(this, RecorderService::class.java)
+                      i.action = action
+                      startService(i)
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/java/com/hiddeninfo/screenrecorder/Prefs.kt <<'KTEOF'
+          package com.hiddeninfo.screenrecorder
+
+          import android.content.Context
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableLongStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+
+          data class RecSettings(
+              val resolution: Int = 1080,   // short side in px, 0 = native
+              val fps: Int = 30,
+              val bitrateMbps: Int = 0,     // 0 = auto
+              val audio: Int = 1,           // 0 none, 1 mic, 2 internal, 3 both
+              val orientation: Int = 0,     // 0 auto, 1 portrait, 2 landscape
+              val countdown: Int = 3,
+              val shakeToStop: Boolean = false,
+              val vibrate: Boolean = true,
+              val bengali: Boolean = true
+          )
+
+          object RecState {
+              var recording by mutableStateOf(false)
+              var paused by mutableStateOf(false)
+              var countdown by mutableIntStateOf(-1)
+              var elapsedMs by mutableLongStateOf(0L)
+              var libraryVersion by mutableIntStateOf(0)
+          }
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("srp_settings", Context.MODE_PRIVATE)
+
+              fun load(c: Context): RecSettings {
+                  val p = sp(c)
+                  val d = RecSettings()
+                  return RecSettings(
+                      resolution = p.getInt("res", d.resolution),
+                      fps = p.getInt("fps", d.fps),
+                      bitrateMbps = p.getInt("br", d.bitrateMbps),
+                      audio = p.getInt("audio", d.audio),
+                      orientation = p.getInt("ori", d.orientation),
+                      countdown = p.getInt("cd", d.countdown),
+                      shakeToStop = p.getBoolean("shake", d.shakeToStop),
+                      vibrate = p.getBoolean("vib", d.vibrate),
+                      bengali = p.getBoolean("bn", d.bengali)
+                  )
+              }
+
+              fun save(c: Context, s: RecSettings) {
+                  sp(c).edit()
+                      .putInt("res", s.resolution)
+                      .putInt("fps", s.fps)
+                      .putInt("br", s.bitrateMbps)
+                      .putInt("audio", s.audio)
+                      .putInt("ori", s.orientation)
+                      .putInt("cd", s.countdown)
+                      .putBoolean("shake", s.shakeToStop)
+                      .putBoolean("vib", s.vibrate)
+                      .putBoolean("bn", s.bengali)
+                      .apply()
+              }
+          }
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/java/com/hiddeninfo/screenrecorder/RecorderService.kt <<'KTEOF'
+          package com.hiddeninfo.screenrecorder
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.graphics.drawable.Icon
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.hardware.display.DisplayManager
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.ParcelFileDescriptor
+          import android.os.SystemClock
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.provider.MediaStore
+          import android.util.DisplayMetrics
+          import android.view.Display
+          import android.widget.Toast
+          import androidx.core.content.IntentCompat
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+          import kotlin.math.sqrt
+
+          class RecorderService : Service(), SensorEventListener {
+
+              companion object {
+                  const val ACTION_START = "com.hiddeninfo.screenrecorder.START"
+                  const val ACTION_STOP = "com.hiddeninfo.screenrecorder.STOP"
+                  const val ACTION_PAUSE = "com.hiddeninfo.screenrecorder.PAUSE"
+                  const val ACTION_RESUME = "com.hiddeninfo.screenrecorder.RESUME"
+                  const val EXTRA_CODE = "code"
+                  const val EXTRA_DATA = "data"
+                  const val CH_REC = "rec_channel"
+                  const val CH_DONE = "rec_done"
+                  const val NOTIF_ID = 101
+                  const val DONE_ID = 102
+              }
+
+              private var settings = RecSettings()
+              private var projection: MediaProjection? = null
+              private var recorder: ScreenRecorder? = null
+              private var pendingCode = 0
+              private var pendingData: Intent? = null
+              private var outUri: Uri? = null
+              private var pfd: ParcelFileDescriptor? = null
+              private var sm: SensorManager? = null
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var segmentStart = 0L
+              private var accumulated = 0L
+              private var cdLeft = 0
+              private var shakeCount = 0
+              private var lastShake = 0L
+
+              private fun t(en: String, bn: String): String = if (settings.bengali) bn else en
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      if (RecState.recording && !RecState.paused) {
+                          RecState.elapsedMs = currentElapsed()
+                      }
+                      handler.postDelayed(this, 500)
+                  }
+              }
+
+              private val countdownTick = object : Runnable {
+                  override fun run() {
+                      cdLeft -= 1
+                      if (cdLeft <= 0) {
+                          RecState.countdown = -1
+                          beginCapture()
+                      } else {
+                          RecState.countdown = cdLeft
+                          vibrate(25)
+                          updateNotification()
+                          handler.postDelayed(this, 1000)
+                      }
+                  }
+              }
+
+              private fun currentElapsed(): Long {
+                  return if (RecState.paused) accumulated
+                  else accumulated + (SystemClock.elapsedRealtime() - segmentStart)
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_START -> startRecording(intent)
+                      ACTION_STOP -> {
+                          if (RecState.countdown > 0) cancelCountdown()
+                          else if (RecState.recording) stopRecording()
+                          else stopSelf()
+                      }
+                      ACTION_PAUSE -> pauseRecording()
+                      ACTION_RESUME -> resumeRecording()
+                      else -> if (!RecState.recording && RecState.countdown <= 0) stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              // ------------------------------------------------------------ start
+              private fun startRecording(intent: Intent) {
+                  if (RecState.recording || RecState.countdown > 0) return
+                  settings = Prefs.load(this)
+                  createChannels()
+                  pendingCode = intent.getIntExtra(EXTRA_CODE, 0)
+                  pendingData = IntentCompat.getParcelableExtra(intent, EXTRA_DATA, Intent::class.java)
+
+                  val micOk = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                  val useAudio = settings.audio != 0 && micOk
+                  var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                  if (useAudio && Build.VERSION.SDK_INT >= 30) {
+                      type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                  }
+                  if (settings.countdown > 0) {
+                      cdLeft = settings.countdown
+                      RecState.countdown = cdLeft
+                  }
+                  try {
+                      startForeground(NOTIF_ID, buildNotification(), type)
+                  } catch (e: Exception) {
+                      Toast.makeText(this, t("Cannot start recorder: ", "রেকর্ডার চালু করা যায়নি: ") + e.message, Toast.LENGTH_LONG).show()
+                      RecState.countdown = -1
+                      stopSelf()
+                      return
+                  }
+                  if (settings.audio != 0 && !micOk) {
+                      Toast.makeText(
+                          this,
+                          t("Mic permission denied - recording without sound", "মাইক পারমিশন নেই - সাউন্ড ছাড়া রেকর্ড হবে"),
+                          Toast.LENGTH_LONG
+                      ).show()
+                  }
+                  if (settings.countdown > 0) {
+                      handler.postDelayed(countdownTick, 1000)
+                  } else {
+                      beginCapture()
+                  }
+              }
+
+              private fun cancelCountdown() {
+                  handler.removeCallbacks(countdownTick)
+                  RecState.countdown = -1
+                  pendingData = null
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              private fun beginCapture() {
+                  val data = pendingData
+                  if (data == null) {
+                      fail(t("Permission data missing", "পারমিশন ডেটা পাওয়া যায়নি"))
+                      return
+                  }
+                  try {
+                      val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      val p = mpm.getMediaProjection(pendingCode, data)
+                      projection = p
+                      p.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() {
+                              handler.post { if (RecState.recording) stopRecording() }
+                          }
+                      }, handler)
+                  } catch (e: Exception) {
+                      fail(t("Screen capture failed: ", "স্ক্রিন ক্যাপচার ব্যর্থ: ") + e.message)
+                      return
+                  }
+                  pendingData = null
+
+                  try {
+                      val name = "Rec_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+                      val values = ContentValues()
+                      values.put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                      values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      values.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/ScreenRecorder")
+                      values.put(MediaStore.Video.Media.IS_PENDING, 1)
+                      val uri = contentResolver.insert(MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
+                      if (uri == null) {
+                          fail(t("Cannot create file", "ফাইল তৈরি করা যায়নি"))
+                          return
+                      }
+                      outUri = uri
+                      pfd = contentResolver.openFileDescriptor(uri, "rw")
+                  } catch (e: Exception) {
+                      fail(t("Storage error: ", "স্টোরেজ সমস্যা: ") + e.message)
+                      return
+                  }
+
+                  val attempts = buildAttempts()
+                  var started: ScreenRecorder? = null
+                  var lastErr: Exception? = null
+                  for (cfg in attempts) {
+                      val r = ScreenRecorder(projection!!, cfg, pfd!!.fileDescriptor)
+                      try {
+                          r.start()
+                          started = r
+                          break
+                      } catch (e: Exception) {
+                          lastErr = e
+                      }
+                  }
+                  if (started == null) {
+                      fail(t("Encoder failed: ", "এনকোডার ব্যর্থ: ") + (lastErr?.message ?: ""))
+                      return
+                  }
+                  recorder = started
+                  if (settings.audio != 0) {
+                      val wantMic = settings.audio == 1 || settings.audio == 3
+                      val wantInt = settings.audio == 2 || settings.audio == 3
+                      if (wantInt && !started.internalActive) {
+                          Toast.makeText(this, t("Internal audio not available on this device", "এই ফোনে ইন্টারনাল অডিও পাওয়া যায়নি"), Toast.LENGTH_LONG).show()
+                      } else if (wantMic && !started.micActive && settings.audio == 1) {
+                          Toast.makeText(this, t("Microphone not available", "মাইক পাওয়া যায়নি"), Toast.LENGTH_LONG).show()
+                      }
+                  }
+
+                  accumulated = 0L
+                  segmentStart = SystemClock.elapsedRealtime()
+                  RecState.elapsedMs = 0L
+                  RecState.paused = false
+                  RecState.recording = true
+                  handler.removeCallbacks(ticker)
+                  handler.post(ticker)
+                  if (settings.shakeToStop) registerShake()
+                  vibrate(80)
+                  updateNotification()
+              }
+
+              @Suppress("DEPRECATION")
+              private fun buildAttempts(): List<RecConfig> {
+                  val dm = DisplayMetrics()
+                  val dmgr = getSystemService(DISPLAY_SERVICE) as DisplayManager
+                  dmgr.getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(dm)
+                  val w = dm.widthPixels
+                  val h = dm.heightPixels
+                  val shortSide = min(w, h)
+                  val longSide = max(w, h)
+                  val pw: Int
+                  val ph: Int
+                  when (settings.orientation) {
+                      1 -> { pw = shortSide; ph = longSide }
+                      2 -> { pw = longSide; ph = shortSide }
+                      else -> { pw = w; ph = h }
+                  }
+                  val wantMic = settings.audio == 1 || settings.audio == 3
+                  val wantInt = settings.audio == 2 || settings.audio == 3
+                  val micOk = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                  val mic = wantMic && micOk
+                  val internal = wantInt && micOk
+
+                  fun align(v: Float): Int = max(16, (v / 16f).roundToInt() * 16)
+                  fun make(targetShort: Int, fps: Int, bitrate: Int): RecConfig {
+                      val target = if (targetShort <= 0) shortSide else min(targetShort, shortSide)
+                      val scale = target.toFloat() / shortSide.toFloat()
+                      val ow = align(pw * scale)
+                      val oh = align(ph * scale)
+                      val br = if (bitrate > 0) bitrate
+                      else (ow.toLong() * oh * fps * 0.09).toInt().coerceIn(3000000, 40000000)
+                      return RecConfig(ow, oh, dm.densityDpi, fps, br, mic, internal)
+                  }
+
+                  val fps = settings.fps
+                  val userBr = settings.bitrateMbps * 1000000
+                  val list = ArrayList<RecConfig>()
+                  list.add(make(settings.resolution, fps, userBr))
+                  list.add(make(min(if (settings.resolution == 0) 1080 else settings.resolution, 1080), min(fps, 30), 0))
+                  list.add(make(720, 30, 0))
+                  return list
+              }
+
+              // ------------------------------------------------------------- pause
+              private fun pauseRecording() {
+                  if (!RecState.recording || RecState.paused) return
+                  recorder?.pause()
+                  accumulated += SystemClock.elapsedRealtime() - segmentStart
+                  RecState.elapsedMs = accumulated
+                  RecState.paused = true
+                  updateNotification()
+              }
+
+              private fun resumeRecording() {
+                  if (!RecState.recording || !RecState.paused) return
+                  recorder?.resume()
+                  segmentStart = SystemClock.elapsedRealtime()
+                  RecState.paused = false
+                  updateNotification()
+              }
+
+              // -------------------------------------------------------------- stop
+              private fun stopRecording() {
+                  if (!RecState.recording) return
+                  handler.removeCallbacks(ticker)
+                  RecState.recording = false
+                  RecState.paused = false
+                  val rec = recorder
+                  recorder = null
+                  vibrate(80)
+                  Thread {
+                      val ok = try {
+                          rec?.stop() ?: false
+                      } catch (e: Exception) {
+                          false
+                      }
+                      handler.post { finalizeOutput(ok) }
+                  }.start()
+              }
+
+              private fun fail(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                  RecState.countdown = -1
+                  RecState.recording = false
+                  finalizeOutput(false, silent = true)
+              }
+
+              private fun finalizeOutput(ok: Boolean, silent: Boolean = false) {
+                  try {
+                      pfd?.close()
+                  } catch (e: Exception) {
+                  }
+                  pfd = null
+                  val uri = outUri
+                  outUri = null
+                  if (uri != null) {
+                      if (ok) {
+                          try {
+                              val v = ContentValues()
+                              v.put(MediaStore.Video.Media.IS_PENDING, 0)
+                              contentResolver.update(uri, v, null, null)
+                          } catch (e: Exception) {
+                          }
+                      } else {
+                          try {
+                              contentResolver.delete(uri, null, null)
+                          } catch (e: Exception) {
+                          }
+                      }
+                  }
+                  try {
+                      projection?.stop()
+                  } catch (e: Exception) {
+                  }
+                  projection = null
+                  try {
+                      sm?.unregisterListener(this)
+                  } catch (e: Exception) {
+                  }
+                  sm = null
+                  handler.removeCallbacks(ticker)
+                  RecState.recording = false
+                  RecState.paused = false
+                  RecState.countdown = -1
+                  try {
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                  } catch (e: Exception) {
+                  }
+                  if (ok && uri != null) {
+                      RecState.libraryVersion = RecState.libraryVersion + 1
+                      showDone(uri)
+                  } else if (!silent) {
+                      Toast.makeText(this, t("Recording failed or empty", "রেকর্ডিং ব্যর্থ হয়েছে"), Toast.LENGTH_LONG).show()
+                  }
+                  stopSelf()
+              }
+
+              // ----------------------------------------------------- notifications
+              private fun createChannels() {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  val c1 = NotificationChannel(CH_REC, "Recording", NotificationManager.IMPORTANCE_LOW)
+                  c1.setShowBadge(false)
+                  nm.createNotificationChannel(c1)
+                  val c2 = NotificationChannel(CH_DONE, "Saved recordings", NotificationManager.IMPORTANCE_DEFAULT)
+                  nm.createNotificationChannel(c2)
+              }
+
+              private fun servicePi(action: String, rc: Int): PendingIntent {
+                  val i = Intent(this, RecorderService::class.java)
+                  i.action = action
+                  return PendingIntent.getService(this, rc, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              }
+
+              private fun buildNotification(): Notification {
+                  val cd = RecState.countdown
+                  val paused = RecState.paused
+                  val open = PendingIntent.getActivity(
+                      this, 0,
+                      Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val title = when {
+                      cd > 0 -> t("Starting in ${cd}...", "${cd} সেকেন্ডে শুরু হবে...")
+                      paused -> t("Recording paused", "রেকর্ডিং বিরতিতে আছে")
+                      else -> t("Recording screen", "স্ক্রিন রেকর্ড হচ্ছে")
+                  }
+                  val text = if (cd > 0) t("Tap Cancel to abort", "বাতিল করতে Cancel চাপুন")
+                  else t("Use the buttons below to control", "নিচের বাটন দিয়ে নিয়ন্ত্রণ করুন")
+                  val icon = Icon.createWithResource(this, R.drawable.ic_stat)
+                  val b = Notification.Builder(this, CH_REC)
+                      .setSmallIcon(R.drawable.ic_stat)
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setContentIntent(open)
+                      .setOngoing(true)
+                      .setOnlyAlertOnce(true)
+                      .setShowWhen(true)
+                      .setWhen(System.currentTimeMillis() - (if (RecState.recording) currentElapsed() else 0L))
+                      .setUsesChronometer(RecState.recording && !paused && cd <= 0)
+                  if (cd > 0) {
+                      b.addAction(Notification.Action.Builder(icon, t("Cancel", "বাতিল"), servicePi(ACTION_STOP, 3)).build())
+                  } else {
+                      if (paused) {
+                          b.addAction(Notification.Action.Builder(icon, t("Resume", "চালু করুন"), servicePi(ACTION_RESUME, 2)).build())
+                      } else {
+                          b.addAction(Notification.Action.Builder(icon, t("Pause", "বিরতি"), servicePi(ACTION_PAUSE, 2)).build())
+                      }
+                      b.addAction(Notification.Action.Builder(icon, t("Stop", "বন্ধ করুন"), servicePi(ACTION_STOP, 3)).build())
+                  }
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      b.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+                  }
+                  return b.build()
+              }
+
+              private fun updateNotification() {
+                  try {
+                      val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                      nm.notify(NOTIF_ID, buildNotification())
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun showDone(uri: Uri) {
+                  try {
+                      val view = Intent(Intent.ACTION_VIEW)
+                      view.setDataAndType(uri, "video/mp4")
+                      view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                      val pi = PendingIntent.getActivity(this, 5, view, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                      val n = Notification.Builder(this, CH_DONE)
+                          .setSmallIcon(R.drawable.ic_stat)
+                          .setContentTitle(t("Recording saved", "রেকর্ডিং সেভ হয়েছে"))
+                          .setContentText(t("Tap to play - Movies/ScreenRecorder", "দেখতে ট্যাপ করুন - Movies/ScreenRecorder"))
+                          .setContentIntent(pi)
+                          .setAutoCancel(true)
+                          .build()
+                      val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                      nm.notify(DONE_ID, n)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun vibrate(ms: Long) {
+                  if (!settings.vibrate) return
+                  try {
+                      val v = getSystemService(VIBRATOR_SERVICE) as Vibrator
+                      v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              // ------------------------------------------------------- shake to stop
+              private fun registerShake() {
+                  try {
+                      val m = getSystemService(SENSOR_SERVICE) as SensorManager
+                      sm = m
+                      m.registerListener(this, m.getDefaultSensor(Sensor.TYPE_ACCELEROMETER), SensorManager.SENSOR_DELAY_UI)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              override fun onSensorChanged(e: SensorEvent) {
+                  val x = e.values[0]
+                  val y = e.values[1]
+                  val z = e.values[2]
+                  val g = sqrt(x * x + y * y + z * z) / SensorManager.GRAVITY_EARTH
+                  if (g > 2.8f) {
+                      val now = SystemClock.elapsedRealtime()
+                      if (now - lastShake < 350) return
+                      if (now - lastShake > 2000) shakeCount = 0
+                      lastShake = now
+                      shakeCount++
+                      if (shakeCount >= 3) {
+                          shakeCount = 0
+                          handler.post { if (RecState.recording) stopRecording() }
+                      }
+                  }
+              }
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+              override fun onDestroy() {
+                  handler.removeCallbacksAndMessages(null)
+                  try {
+                      sm?.unregisterListener(this)
+                  } catch (e: Exception) {
+                  }
+                  super.onDestroy()
+              }
+          }
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/java/com/hiddeninfo/screenrecorder/ScreenRecorder.kt <<'KTEOF'
+          package com.hiddeninfo.screenrecorder
+
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioPlaybackCaptureConfiguration
+          import android.media.AudioRecord
+          import android.media.MediaCodec
+          import android.media.MediaCodecInfo
+          import android.media.MediaFormat
+          import android.media.MediaMuxer
+          import android.media.MediaRecorder
+          import android.media.projection.MediaProjection
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.view.Surface
+          import java.io.FileDescriptor
+          import java.nio.ByteOrder
+
+          data class RecConfig(
+              val width: Int,
+              val height: Int,
+              val dpi: Int,
+              val fps: Int,
+              val bitrate: Int,
+              val mic: Boolean,
+              val internal: Boolean
+          )
+
+          /**
+           * Screen + audio recorder.
+           * Video: MediaProjection -> VirtualDisplay -> H.264 (MediaCodec surface input)
+           * Audio: mic and/or internal (AudioPlaybackCapture) -> mixed -> AAC
+           * Output: MP4 via MediaMuxer. Supports pause / resume.
+           */
+          class ScreenRecorder(
+              private val projection: MediaProjection,
+              private val cfg: RecConfig,
+              private val fd: FileDescriptor
+          ) {
+              companion object {
+                  const val SR = 44100
+              }
+
+              var micActive = false
+                  private set
+              var internalActive = false
+                  private set
+
+              private var vEnc: MediaCodec? = null
+              private var aEnc: MediaCodec? = null
+              private var muxer: MediaMuxer? = null
+              private var vDisplay: VirtualDisplay? = null
+              private var micRec: AudioRecord? = null
+              private var capRec: AudioRecord? = null
+              private var surface: Surface? = null
+              private var vThread: Thread? = null
+              private var aThread: Thread? = null
+
+              private val muxLock = Any()
+              @Volatile private var muxerStarted = false
+              private var tracksExpected = 1
+              private var tracksAdded = 0
+              private var vTrack = -1
+              private var aTrack = -1
+
+              @Volatile private var stopping = false
+              @Volatile private var paused = false
+              @Volatile private var failed = false
+              @Volatile private var wroteVideo = false
+              @Volatile private var stopReqMs = 0L
+              private var startUs = 0L
+              @Volatile private var pausedTotalUs = 0L
+              private var pauseStartUs = 0L
+
+              private fun nowUs(): Long = System.nanoTime() / 1000L
+
+              // ---------------------------------------------------------------- start
+              fun start() {
+                  try {
+                      val vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, cfg.width, cfg.height)
+                      vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                      vf.setInteger(MediaFormat.KEY_BIT_RATE, cfg.bitrate)
+                      vf.setInteger(MediaFormat.KEY_FRAME_RATE, cfg.fps)
+                      vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                      val venc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                      vEnc = venc
+                      venc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                      val surf = venc.createInputSurface()
+                      surface = surf
+
+                      if (cfg.mic) {
+                          try {
+                              micRec = buildMic()
+                              micActive = true
+                          } catch (e: Exception) {
+                              micRec = null
+                          }
+                      }
+                      if (cfg.internal) {
+                          try {
+                              capRec = buildCapture()
+                              internalActive = true
+                          } catch (e: Exception) {
+                              capRec = null
+                          }
+                      }
+                      if (micRec != null || capRec != null) {
+                          val af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, SR, 2)
+                          af.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                          af.setInteger(MediaFormat.KEY_BIT_RATE, 128000)
+                          af.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+                          val aenc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                          aEnc = aenc
+                          aenc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                          tracksExpected = 2
+                      }
+
+                      muxer = MediaMuxer(fd, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                      startUs = nowUs()
+                      venc.start()
+                      aEnc?.start()
+                      vDisplay = projection.createVirtualDisplay(
+                          "ScreenRecorderPro", cfg.width, cfg.height, cfg.dpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surf, null, null
+                      )
+                      micRec?.startRecording()
+                      capRec?.startRecording()
+
+                      val vt = Thread({ videoLoop() }, "rec-video")
+                      vThread = vt
+                      vt.start()
+                      if (aEnc != null) {
+                          val at = Thread({ audioLoop() }, "rec-audio")
+                          aThread = at
+                          at.start()
+                      }
+                  } catch (e: Exception) {
+                      releaseAll()
+                      throw e
+                  }
+              }
+
+              private fun buildMic(): AudioRecord {
+                  val fmt = AudioFormat.Builder()
+                      .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                      .setSampleRate(SR)
+                      .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                      .build()
+                  val min = AudioRecord.getMinBufferSize(SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                  val rec = AudioRecord.Builder()
+                      .setAudioSource(MediaRecorder.AudioSource.MIC)
+                      .setAudioFormat(fmt)
+                      .setBufferSizeInBytes(maxOf(min * 2, 16384))
+                      .build()
+                  if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                      rec.release()
+                      throw IllegalStateException("mic init failed")
+                  }
+                  return rec
+              }
+
+              private fun buildCapture(): AudioRecord {
+                  val pc = AudioPlaybackCaptureConfiguration.Builder(projection)
+                      .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                      .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                      .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                      .build()
+                  val fmt = AudioFormat.Builder()
+                      .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                      .setSampleRate(SR)
+                      .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                      .build()
+                  val min = AudioRecord.getMinBufferSize(SR, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+                  val rec = AudioRecord.Builder()
+                      .setAudioFormat(fmt)
+                      .setBufferSizeInBytes(maxOf(min * 2, 16384))
+                      .setAudioPlaybackCaptureConfig(pc)
+                      .build()
+                  if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                      rec.release()
+                      throw IllegalStateException("capture init failed")
+                  }
+                  return rec
+              }
+
+              // ------------------------------------------------------------- muxer
+              private fun addTrack(f: MediaFormat, video: Boolean) {
+                  synchronized(muxLock) {
+                      val m = muxer ?: return
+                      if (muxerStarted) return
+                      val i = m.addTrack(f)
+                      if (video) vTrack = i else aTrack = i
+                      tracksAdded++
+                      if (tracksAdded >= tracksExpected) {
+                          m.start()
+                          muxerStarted = true
+                      }
+                  }
+              }
+
+              private fun waitMuxer(): Boolean {
+                  var n = 0
+                  while (!muxerStarted && n < 300 && !failed) {
+                      Thread.sleep(10)
+                      n++
+                  }
+                  if (!muxerStarted) {
+                      // audio never arrived: start with video only
+                      synchronized(muxLock) {
+                          val m = muxer
+                          if (!muxerStarted && m != null && vTrack >= 0) {
+                              try {
+                                  m.start()
+                                  muxerStarted = true
+                              } catch (e: Exception) {
+                                  failed = true
+                              }
+                          }
+                      }
+                  }
+                  return muxerStarted
+              }
+
+              // -------------------------------------------------------- video loop
+              private fun videoLoop() {
+                  val enc = vEnc ?: return
+                  val info = MediaCodec.BufferInfo()
+                  var base = -1L
+                  var lastPts = -1L
+                  try {
+                      while (true) {
+                          val idx = enc.dequeueOutputBuffer(info, 10000)
+                          if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                              addTrack(enc.outputFormat, true)
+                          } else if (idx >= 0) {
+                              val buf = enc.getOutputBuffer(idx)
+                              val eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                              if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0
+                              if (info.size > 0 && buf != null && !paused) {
+                                  if (base < 0) {
+                                      val now = nowUs()
+                                      base = if (Math.abs(info.presentationTimeUs - now) < 5000000L) startUs
+                                      else info.presentationTimeUs - (now - startUs)
+                                  }
+                                  if (waitMuxer()) {
+                                      var pts = info.presentationTimeUs - base - pausedTotalUs
+                                      if (pts < 0) pts = 0
+                                      if (pts <= lastPts) pts = lastPts + 1
+                                      lastPts = pts
+                                      buf.position(info.offset)
+                                      buf.limit(info.offset + info.size)
+                                      info.presentationTimeUs = pts
+                                      synchronized(muxLock) {
+                                          muxer?.writeSampleData(vTrack, buf, info)
+                                      }
+                                      wroteVideo = true
+                                  }
+                              }
+                              enc.releaseOutputBuffer(idx, false)
+                              if (eos) break
+                          } else if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                              if (stopping && SystemClock.elapsedRealtime() - stopReqMs > 6000) break
+                          }
+                      }
+                  } catch (e: Exception) {
+                      failed = true
+                  }
+              }
+
+              // -------------------------------------------------------- audio loop
+              private fun clip(v: Int): Short {
+                  return if (v > 32767) 32767.toShort() else if (v < -32768) (-32768).toShort() else v.toShort()
+              }
+
+              private fun drainAudio(enc: MediaCodec, info: MediaCodec.BufferInfo, timeoutUs: Long): Boolean {
+                  while (true) {
+                      val idx = enc.dequeueOutputBuffer(info, timeoutUs)
+                      if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) return false
+                      if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                          addTrack(enc.outputFormat, false)
+                          continue
+                      }
+                      if (idx >= 0) {
+                          val buf = enc.getOutputBuffer(idx)
+                          val eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                          if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0
+                          if (info.size > 0 && buf != null) {
+                              if (waitMuxer() && aTrack >= 0) {
+                                  buf.position(info.offset)
+                                  buf.limit(info.offset + info.size)
+                                  synchronized(muxLock) {
+                                      muxer?.writeSampleData(aTrack, buf, info)
+                                  }
+                              }
+                          }
+                          enc.releaseOutputBuffer(idx, false)
+                          if (eos) return true
+                      }
+                  }
+              }
+
+              private fun audioLoop() {
+                  val enc = aEnc ?: return
+                  val info = MediaCodec.BufferInfo()
+                  val frames = 1024
+                  val micBuf = ShortArray(frames)
+                  val capBuf = ShortArray(frames * 2)
+                  val outBuf = ShortArray(frames * 2)
+                  val m = micRec
+                  val c = capRec
+                  var samples = 0L
+                  var basePts = 0L
+                  var lastEnd = 0L
+                  var needSync = true
+                  try {
+                      while (!stopping) {
+                          var gotMic = 0
+                          var gotCap = 0
+                          if (m != null) {
+                              val r = m.read(micBuf, 0, frames)
+                              gotMic = if (r > 0) r else 0
+                          }
+                          if (c != null) {
+                              val r = c.read(capBuf, 0, frames * 2)
+                              gotCap = if (r > 0) r else 0
+                          }
+                          val n = if (m != null && c != null) minOf(gotMic, gotCap / 2)
+                          else if (m != null) gotMic
+                          else gotCap / 2
+                          if (n <= 0) {
+                              Thread.sleep(5)
+                              drainAudio(enc, info, 0)
+                              continue
+                          }
+                          if (paused) {
+                              needSync = true
+                              continue
+                          }
+                          for (i in 0 until n) {
+                              val mv = if (m != null) micBuf[i].toInt() else 0
+                              val l = mv + (if (c != null) capBuf[2 * i].toInt() else 0)
+                              val r = mv + (if (c != null) capBuf[2 * i + 1].toInt() else 0)
+                              outBuf[2 * i] = clip(l)
+                              outBuf[2 * i + 1] = clip(r)
+                          }
+                          if (needSync) {
+                              val chunkUs = n * 1000000L / SR
+                              basePts = maxOf(nowUs() - startUs - pausedTotalUs - chunkUs, lastEnd)
+                              samples = 0
+                              needSync = false
+                          }
+                          val pts = basePts + samples * 1000000L / SR
+                          samples += n
+                          lastEnd = basePts + samples * 1000000L / SR
+
+                          var queued = false
+                          var tries = 0
+                          while (!queued && tries < 50) {
+                              val ii = enc.dequeueInputBuffer(10000)
+                              if (ii >= 0) {
+                                  val ib = enc.getInputBuffer(ii)
+                                  if (ib != null) {
+                                      ib.clear()
+                                      ib.order(ByteOrder.nativeOrder())
+                                      ib.asShortBuffer().put(outBuf, 0, n * 2)
+                                      enc.queueInputBuffer(ii, 0, n * 4, pts, 0)
+                                  }
+                                  queued = true
+                              }
+                              drainAudio(enc, info, 0)
+                              tries++
+                          }
+                      }
+                      // end of stream
+                      var tries = 0
+                      while (tries < 100) {
+                          val ii = enc.dequeueInputBuffer(10000)
+                          if (ii >= 0) {
+                              enc.queueInputBuffer(ii, 0, 0, lastEnd, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                              break
+                          }
+                          drainAudio(enc, info, 0)
+                          tries++
+                      }
+                      var k = 0
+                      while (k < 200) {
+                          if (drainAudio(enc, info, 10000)) break
+                          k++
+                      }
+                  } catch (e: Exception) {
+                      failed = true
+                  }
+              }
+
+              // ------------------------------------------------------ pause/resume
+              fun pause() {
+                  if (paused || stopping) return
+                  pauseStartUs = nowUs()
+                  paused = true
+              }
+
+              fun resume() {
+                  if (!paused) return
+                  pausedTotalUs += nowUs() - pauseStartUs
+                  try {
+                      val b = Bundle()
+                      b.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                      vEnc?.setParameters(b)
+                  } catch (e: Exception) {
+                  }
+                  paused = false
+              }
+
+              // -------------------------------------------------------------- stop
+              /** returns true when a valid file was written */
+              fun stop(): Boolean {
+                  if (stopping) return false
+                  stopping = true
+                  stopReqMs = SystemClock.elapsedRealtime()
+                  try {
+                      vDisplay?.release()
+                  } catch (e: Exception) {
+                  }
+                  vDisplay = null
+                  try {
+                      vEnc?.signalEndOfInputStream()
+                  } catch (e: Exception) {
+                      failed = true
+                  }
+                  try {
+                      aThread?.join(5000)
+                      vThread?.join(7000)
+                  } catch (e: Exception) {
+                  }
+                  val wrote = wroteVideo && muxerStarted
+                  val closed = releaseAll()
+                  return wrote && closed
+              }
+
+              private fun releaseAll(): Boolean {
+                  var ok = true
+                  try {
+                      micRec?.stop()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      micRec?.release()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      capRec?.stop()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      capRec?.release()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      vDisplay?.release()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      vEnc?.stop()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      vEnc?.release()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      aEnc?.stop()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      aEnc?.release()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      surface?.release()
+                  } catch (e: Exception) {
+                  }
+                  try {
+                      if (muxerStarted) muxer?.stop()
+                  } catch (e: Exception) {
+                      ok = false
+                  }
+                  try {
+                      muxer?.release()
+                  } catch (e: Exception) {
+                  }
+                  muxer = null
+                  vEnc = null
+                  aEnc = null
+                  micRec = null
+                  capRec = null
+                  return ok
+              }
+          }
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/java/com/hiddeninfo/screenrecorder/Ui.kt <<'KTEOF'
+          package com.hiddeninfo.screenrecorder
+
+          import android.content.ContentUris
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.net.Uri
+          import android.provider.MediaStore
+          import android.util.Size
+          import android.widget.Toast
+          import androidx.compose.animation.core.FastOutSlowInEasing
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.ColumnScope
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.NavigationBar
+          import androidx.compose.material3.NavigationBarItem
+          import androidx.compose.material3.NavigationBarItemDefaults
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.SwitchDefaults
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.produceState
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object C {
+              val Bg = Color(0xFF0B0F1A)
+              val Surface = Color(0xFF141B2D)
+              val Card = Color(0xFF1B2440)
+              val Accent = Color(0xFFFF3B5C)
+              val Accent2 = Color(0xFF7C4DFF)
+              val Text = Color(0xFFEAF0FF)
+              val Muted = Color(0xFF8D98B5)
+              val Line = Color(0xFF2A3558)
+          }
+
+          fun tr(bn: Boolean, en: String, b: String): String = if (bn) b else en
+
+          fun fmtTime(ms: Long): String {
+              val s = ms / 1000
+              val h = s / 3600
+              val m = (s % 3600) / 60
+              val sec = s % 60
+              return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, sec)
+              else String.format(Locale.US, "%02d:%02d", m, sec)
+          }
+
+          fun audioLabel(bn: Boolean, m: Int): String = when (m) {
+              0 -> tr(bn, "No sound", "সাউন্ড ছাড়া")
+              1 -> tr(bn, "Mic", "মাইক")
+              2 -> tr(bn, "Internal", "ইন্টারনাল")
+              else -> tr(bn, "Mic + Internal", "মাইক + ইন্টারনাল")
+          }
+
+          @Composable
+          fun AppTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = C.Accent,
+                      secondary = C.Accent2,
+                      background = C.Bg,
+                      surface = C.Surface,
+                      onBackground = C.Text,
+                      onSurface = C.Text,
+                      onPrimary = Color.White
+                  ),
+                  content = content
+              )
+          }
+
+          // ============================================================ shared bits
+          @Composable
+          fun PillButton(label: String, color: Color, onClick: () -> Unit) {
+              Box(
+                  Modifier
+                      .clip(RoundedCornerShape(50))
+                      .background(color)
+                      .clickable { onClick() }
+                      .padding(horizontal = 22.dp, vertical = 12.dp),
+                  contentAlignment = Alignment.Center
+              ) {
+                  Text(label, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+              }
+          }
+
+          @Composable
+          fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+              Column(
+                  Modifier
+                      .fillMaxWidth()
+                      .clip(RoundedCornerShape(20.dp))
+                      .background(C.Card)
+                      .padding(16.dp)
+              ) {
+                  Text(title, color = C.Text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(6.dp))
+                  content()
+              }
+          }
+
+          @Composable
+          fun OptionRow(title: String, options: List<Pair<String, Int>>, selected: Int, onSelect: (Int) -> Unit) {
+              Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                  Text(title, color = C.Muted, fontSize = 13.sp)
+                  Spacer(Modifier.height(8.dp))
+                  Row(
+                      Modifier.horizontalScroll(rememberScrollState()),
+                      horizontalArrangement = Arrangement.spacedBy(8.dp)
+                  ) {
+                      options.forEach { (label, v) ->
+                          val sel = v == selected
+                          Box(
+                              Modifier
+                                  .clip(RoundedCornerShape(50))
+                                  .background(if (sel) C.Accent else C.Line)
+                                  .clickable { onSelect(v) }
+                                  .padding(horizontal = 16.dp, vertical = 9.dp)
+                          ) {
+                              Text(
+                                  label,
+                                  color = Color.White,
+                                  fontSize = 14.sp,
+                                  fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ToggleRow(title: String, sub: String, checked: Boolean, onChecked: (Boolean) -> Unit) {
+              Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                  Column(Modifier.weight(1f)) {
+                      Text(title, color = C.Text, fontSize = 15.sp)
+                      if (sub.isNotEmpty()) Text(sub, color = C.Muted, fontSize = 12.sp)
+                  }
+                  Switch(
+                      checked = checked,
+                      onCheckedChange = onChecked,
+                      colors = SwitchDefaults.colors(checkedTrackColor = C.Accent, checkedThumbColor = Color.White)
+                  )
+              }
+          }
+
+          // ================================================================== root
+          @Composable
+          fun Root(
+              s: RecSettings,
+              onSettings: (RecSettings) -> Unit,
+              onRecord: () -> Unit,
+              onPauseResume: () -> Unit,
+              onStop: () -> Unit,
+              onCancel: () -> Unit
+          ) {
+              var tab by remember { mutableIntStateOf(0) }
+              val bn = s.bengali
+              val tabs = listOf(
+                  "🎥" to tr(bn, "Record", "রেকর্ড"),
+                  "📁" to tr(bn, "Library", "লাইব্রেরি"),
+                  "⚙️" to tr(bn, "Settings", "সেটিংস")
+              )
+              Box(Modifier.fillMaxSize().background(C.Bg)) {
+                  Scaffold(
+                      containerColor = C.Bg,
+                      bottomBar = {
+                          NavigationBar(containerColor = C.Surface) {
+                              tabs.forEachIndexed { i, (ic, label) ->
+                                  NavigationBarItem(
+                                      selected = tab == i,
+                                      onClick = { tab = i },
+                                      icon = { Text(ic, fontSize = 20.sp) },
+                                      label = { Text(label, fontSize = 12.sp) },
+                                      colors = NavigationBarItemDefaults.colors(
+                                          indicatorColor = C.Line,
+                                          selectedTextColor = C.Accent,
+                                          unselectedTextColor = C.Muted
+                                      )
+                                  )
+                              }
+                          }
+                      }
+                  ) { pad ->
+                      Box(Modifier.padding(pad).fillMaxSize()) {
+                          when (tab) {
+                              0 -> HomeScreen(s, onRecord, onPauseResume, onStop)
+                              1 -> LibraryScreen(bn)
+                              else -> SettingsScreen(s, onSettings)
+                          }
+                      }
+                  }
+                  if (RecState.countdown > 0) CountdownOverlay(RecState.countdown, bn, onCancel)
+              }
+          }
+
+          @Composable
+          fun CountdownOverlay(n: Int, bn: Boolean, onCancel: () -> Unit) {
+              Box(
+                  Modifier.fillMaxSize().background(Color(0xE6000000)).clickable(enabled = false) {},
+                  contentAlignment = Alignment.Center
+              ) {
+                  Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
+                      Text("$n", color = Color.White, fontSize = 140.sp, fontWeight = FontWeight.Bold)
+                      Text(
+                          tr(bn, "Go to the screen you want to record...", "যে স্ক্রিন রেকর্ড করবেন সেখানে চলে যান..."),
+                          color = C.Muted, textAlign = TextAlign.Center, fontSize = 15.sp
+                      )
+                      Spacer(Modifier.height(24.dp))
+                      PillButton(tr(bn, "Cancel", "বাতিল"), C.Line, onCancel)
+                  }
+              }
+          }
+
+          // ================================================================== home
+          @Composable
+          fun HomeScreen(s: RecSettings, onRecord: () -> Unit, onPauseResume: () -> Unit, onStop: () -> Unit) {
+              val bn = s.bengali
+              val rec = RecState.recording
+              val paused = RecState.paused
+              val inf = rememberInfiniteTransition(label = "pulse")
+              val pulse by inf.animateFloat(
+                  initialValue = 1f,
+                  targetValue = 1.2f,
+                  animationSpec = infiniteRepeatable(tween(900, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+                  label = "p"
+              )
+              val resLabel = if (s.resolution == 0) tr(bn, "Native", "অরিজিনাল") else "${s.resolution}p"
+              val summary = resLabel + "  •  " + s.fps + " fps  •  " + audioLabel(bn, s.audio)
+
+              Column(
+                  Modifier
+                      .fillMaxSize()
+                      .background(Brush.verticalGradient(listOf(C.Bg, Color(0xFF121A34))))
+                      .padding(20.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Spacer(Modifier.height(6.dp))
+                  Text("Screen Recorder Pro", color = C.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                  Text(
+                      tr(bn, "Full HD  •  Mic  •  Internal audio", "ফুল HD  •  মাইক  •  ইন্টারনাল অডিও"),
+                      color = C.Muted, fontSize = 13.sp
+                  )
+                  Spacer(Modifier.weight(1f))
+
+                  Box(contentAlignment = Alignment.Center, modifier = Modifier.size(240.dp)) {
+                      if (rec && !paused) {
+                          Box(
+                              Modifier
+                                  .size(200.dp)
+                                  .graphicsLayer { scaleX = pulse; scaleY = pulse; alpha = 0.22f }
+                                  .background(C.Accent, CircleShape)
+                          )
+                      }
+                      Box(
+                          Modifier
+                              .size(180.dp)
+                              .clip(CircleShape)
+                              .background(
+                                  Brush.radialGradient(
+                                      listOf(if (paused) Color(0xFFB9A3FF) else Color(0xFFFF7A93), if (paused) C.Accent2 else C.Accent)
+                                  )
+                              )
+                              .clickable { if (rec) onStop() else onRecord() },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          if (rec) {
+                              Box(Modifier.size(58.dp).background(Color.White, RoundedCornerShape(14.dp)))
+                          } else {
+                              Box(Modifier.size(78.dp).border(5.dp, Color.White, CircleShape), contentAlignment = Alignment.Center) {
+                                  Box(Modifier.size(34.dp).background(Color.White, CircleShape))
+                              }
+                          }
+                      }
+                  }
+
+                  Spacer(Modifier.height(18.dp))
+                  if (rec) {
+                      Text(fmtTime(RecState.elapsedMs), color = C.Text, fontSize = 46.sp, fontWeight = FontWeight.Bold)
+                      Text(
+                          if (paused) tr(bn, "Paused", "বিরতিতে আছে")
+                          else tr(bn, "Recording... stop from the notification bar", "রেকর্ডিং চলছে... নোটিফিকেশন বার থেকে বন্ধ করুন"),
+                          color = if (paused) C.Accent2 else C.Accent, fontSize = 14.sp, textAlign = TextAlign.Center
+                      )
+                      Spacer(Modifier.height(16.dp))
+                      Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                          PillButton(
+                              if (paused) tr(bn, "▶ Resume", "▶ চালু করুন") else tr(bn, "⏸ Pause", "⏸ বিরতি"),
+                              C.Accent2, onPauseResume
+                          )
+                          PillButton(tr(bn, "⏹ Stop", "⏹ বন্ধ"), C.Accent, onStop)
+                      }
+                  } else {
+                      Text(tr(bn, "Tap to start recording", "রেকর্ড শুরু করতে ট্যাপ করুন"), color = C.Text, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+                      Spacer(Modifier.height(6.dp))
+                      Text(summary, color = C.Muted, fontSize = 13.sp)
+                  }
+
+                  Spacer(Modifier.weight(1f))
+                  Column(
+                      Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(18.dp))
+                          .background(C.Card)
+                          .padding(14.dp)
+                  ) {
+                      Text(tr(bn, "💡 Tips", "💡 টিপস"), color = C.Text, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                      Spacer(Modifier.height(4.dp))
+                      Text(
+                          tr(
+                              bn,
+                              "The app hides while recording - no recorder button on screen. Pause or stop from the notification bar. Saved to Movies/ScreenRecorder.",
+                              "রেকর্ডিং চলার সময় অ্যাপ লুকিয়ে যায় - স্ক্রিনে কোনো রেকর্ডার বাটন থাকে না। নোটিফিকেশন বার থেকে বিরতি বা বন্ধ করুন। ভিডিও Movies/ScreenRecorder ফোল্ডারে সেভ হয়।"
+                          ),
+                          color = C.Muted, fontSize = 12.sp, lineHeight = 17.sp
+                      )
+                  }
+              }
+          }
+
+          // ============================================================== settings
+          @Composable
+          fun SettingsScreen(s: RecSettings, onChange: (RecSettings) -> Unit) {
+              val bn = s.bengali
+              Column(
+                  Modifier
+                      .fillMaxSize()
+                      .background(C.Bg)
+                      .verticalScroll(rememberScrollState())
+                      .padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp)
+              ) {
+                  Text(tr(bn, "Settings", "সেটিংস"), color = C.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+
+                  SectionCard(tr(bn, "🎞 Video", "🎞 ভিডিও")) {
+                      OptionRow(
+                          tr(bn, "Resolution", "রেজোলিউশন"),
+                          listOf(
+                              "480p" to 480, "720p" to 720, "1080p Full HD" to 1080,
+                              "1440p 2K" to 1440, tr(bn, "Native", "অরিজিনাল") to 0
+                          ),
+                          s.resolution
+                      ) { onChange(s.copy(resolution = it)) }
+                      OptionRow(
+                          tr(bn, "Frame rate", "ফ্রেম রেট"),
+                          listOf("15 fps" to 15, "24 fps" to 24, "30 fps" to 30, "60 fps" to 60),
+                          s.fps
+                      ) { onChange(s.copy(fps = it)) }
+                      OptionRow(
+                          tr(bn, "Quality (bitrate)", "কোয়ালিটি (বিটরেট)"),
+                          listOf(
+                              tr(bn, "Auto", "অটো") to 0, "4 Mbps" to 4, "8 Mbps" to 8,
+                              "12 Mbps" to 12, "16 Mbps" to 16, "24 Mbps" to 24
+                          ),
+                          s.bitrateMbps
+                      ) { onChange(s.copy(bitrateMbps = it)) }
+                      OptionRow(
+                          tr(bn, "Orientation", "অরিয়েন্টেশন"),
+                          listOf(
+                              tr(bn, "Auto", "অটো") to 0,
+                              tr(bn, "Portrait", "পোর্ট্রেট") to 1,
+                              tr(bn, "Landscape", "ল্যান্ডস্কেপ") to 2
+                          ),
+                          s.orientation
+                      ) { onChange(s.copy(orientation = it)) }
+                      Text(
+                          tr(bn, "Tip: 1 Mbps is about 7.5 MB per minute.", "টিপস: ১ Mbps ≈ প্রতি মিনিটে ৭.৫ MB।"),
+                          color = C.Muted, fontSize = 12.sp
+                      )
+                  }
+
+                  SectionCard(tr(bn, "🎙 Audio", "🎙 অডিও")) {
+                      OptionRow(
+                          tr(bn, "Sound source", "সাউন্ড সোর্স"),
+                          listOf(
+                              audioLabel(bn, 0) to 0,
+                              tr(bn, "Mic (outside sound)", "মাইক (বাইরের শব্দ)") to 1,
+                              tr(bn, "Internal (phone sound)", "ইন্টারনাল (ফোনের সাউন্ড)") to 2,
+                              audioLabel(bn, 3) to 3
+                          ),
+                          s.audio
+                      ) { onChange(s.copy(audio = it)) }
+                      Text(
+                          tr(
+                              bn,
+                              "Internal audio works on Android 10+. Some apps (calls, DRM apps) block it.",
+                              "ইন্টারনাল অডিও Android 10+ এ কাজ করে। কিছু অ্যাপ (কল, DRM অ্যাপ) ব্লক করে রাখে।"
+                          ),
+                          color = C.Muted, fontSize = 12.sp
+                      )
+                  }
+
+                  SectionCard(tr(bn, "🎛 Controls", "🎛 কন্ট্রোল")) {
+                      OptionRow(
+                          tr(bn, "Countdown before start", "শুরুর আগে কাউন্টডাউন"),
+                          listOf(tr(bn, "Off", "বন্ধ") to 0, "3 s" to 3, "5 s" to 5, "10 s" to 10),
+                          s.countdown
+                      ) { onChange(s.copy(countdown = it)) }
+                      ToggleRow(
+                          tr(bn, "Shake to stop", "ফোন ঝাঁকালে বন্ধ"),
+                          tr(bn, "Shake the phone 3 times to stop recording", "৩ বার ঝাঁকালে রেকর্ডিং বন্ধ হবে"),
+                          s.shakeToStop
+                      ) { onChange(s.copy(shakeToStop = it)) }
+                      ToggleRow(
+                          tr(bn, "Vibrate on start/stop", "শুরু/শেষে ভাইব্রেশন"),
+                          "",
+                          s.vibrate
+                      ) { onChange(s.copy(vibrate = it)) }
+                  }
+
+                  SectionCard(tr(bn, "🌐 App", "🌐 অ্যাপ")) {
+                      ToggleRow(
+                          "বাংলা / English",
+                          tr(bn, "On = Bangla, Off = English", "চালু = বাংলা, বন্ধ = English"),
+                          s.bengali
+                      ) { onChange(s.copy(bengali = it)) }
+                  }
+                  Spacer(Modifier.height(10.dp))
+              }
+          }
+
+          // ============================================================== library
+          data class VideoItem(val uri: Uri, val name: String, val durMs: Long, val size: Long, val dateSec: Long)
+
+          fun loadVideos(ctx: Context): List<VideoItem> {
+              val out = ArrayList<VideoItem>()
+              val proj = arrayOf(
+                  MediaStore.Video.Media._ID,
+                  MediaStore.Video.Media.DISPLAY_NAME,
+                  MediaStore.Video.Media.DURATION,
+                  MediaStore.Video.Media.SIZE,
+                  MediaStore.Video.Media.DATE_ADDED
+              )
+              try {
+                  ctx.contentResolver.query(
+                      MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                      proj,
+                      MediaStore.Video.Media.RELATIVE_PATH + " LIKE ?",
+                      arrayOf("%ScreenRecorder%"),
+                      MediaStore.Video.Media.DATE_ADDED + " DESC"
+                  )?.use { c ->
+                      while (c.moveToNext()) {
+                          val id = c.getLong(0)
+                          out.add(
+                              VideoItem(
+                                  ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id),
+                                  c.getString(1) ?: "video.mp4",
+                                  c.getLong(2), c.getLong(3), c.getLong(4)
+                              )
+                          )
+                      }
+                  }
+              } catch (e: Exception) {
+              }
+              return out
+          }
+
+          fun playVideo(ctx: Context, uri: Uri) {
+              try {
+                  val i = Intent(Intent.ACTION_VIEW)
+                  i.setDataAndType(uri, "video/mp4")
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  ctx.startActivity(i)
+              } catch (e: Exception) {
+                  Toast.makeText(ctx, "No video player found", Toast.LENGTH_SHORT).show()
+              }
+          }
+
+          fun shareVideo(ctx: Context, uri: Uri) {
+              try {
+                  val i = Intent(Intent.ACTION_SEND)
+                  i.type = "video/mp4"
+                  i.putExtra(Intent.EXTRA_STREAM, uri)
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  ctx.startActivity(Intent.createChooser(i, "Share"))
+              } catch (e: Exception) {
+                  Toast.makeText(ctx, "Cannot share", Toast.LENGTH_SHORT).show()
+              }
+          }
+
+          @Composable
+          fun Thumb(uri: Uri, modifier: Modifier) {
+              val ctx = LocalContext.current
+              val bmp by produceState<Bitmap?>(initialValue = null, uri) {
+                  value = withContext(Dispatchers.IO) {
+                      try {
+                          ctx.contentResolver.loadThumbnail(uri, Size(360, 200), null)
+                      } catch (e: Exception) {
+                          null
+                      }
+                  }
+              }
+              val b = bmp
+              if (b != null) {
+                  Image(bitmap = b.asImageBitmap(), contentDescription = null, modifier = modifier, contentScale = ContentScale.Crop)
+              } else {
+                  Box(modifier.background(C.Line), contentAlignment = Alignment.Center) { Text("🎬", fontSize = 22.sp) }
+              }
+          }
+
+          @Composable
+          fun VideoCard(v: VideoItem, bn: Boolean, onDelete: () -> Unit) {
+              val ctx = LocalContext.current
+              val date = SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()).format(Date(v.dateSec * 1000L))
+              val mb = String.format(Locale.US, "%.1f MB", v.size / 1048576.0)
+              Column(
+                  Modifier
+                      .fillMaxWidth()
+                      .clip(RoundedCornerShape(18.dp))
+                      .background(C.Card)
+                      .padding(12.dp)
+              ) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Thumb(v.uri, Modifier.size(width = 120.dp, height = 70.dp).clip(RoundedCornerShape(12.dp)))
+                      Spacer(Modifier.width(12.dp))
+                      Column(Modifier.weight(1f)) {
+                          Text(v.name, color = C.Text, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          Spacer(Modifier.height(2.dp))
+                          Text(fmtTime(v.durMs) + "  •  " + mb, color = C.Muted, fontSize = 12.sp)
+                          Text(date, color = C.Muted, fontSize = 12.sp)
+                      }
+                  }
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                      TextButton(onClick = { playVideo(ctx, v.uri) }) {
+                          Text("▶ " + tr(bn, "Play", "চালান"), color = C.Accent)
+                      }
+                      TextButton(onClick = { shareVideo(ctx, v.uri) }) {
+                          Text("↗ " + tr(bn, "Share", "শেয়ার"), color = C.Accent2)
+                      }
+                      TextButton(onClick = onDelete) {
+                          Text("🗑 " + tr(bn, "Delete", "ডিলিট"), color = C.Muted)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun LibraryScreen(bn: Boolean) {
+              val ctx = LocalContext.current
+              var videos by remember { mutableStateOf(listOf<VideoItem>()) }
+              var toDelete by remember { mutableStateOf<VideoItem?>(null) }
+              var tick by remember { mutableIntStateOf(0) }
+
+              LaunchedEffect(tick, RecState.libraryVersion) {
+                  videos = withContext(Dispatchers.IO) { loadVideos(ctx) }
+              }
+
+              Column(Modifier.fillMaxSize().background(C.Bg).padding(16.dp)) {
+                  Text(tr(bn, "My Recordings", "আমার রেকর্ডিং"), color = C.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.height(12.dp))
+                  if (videos.isEmpty()) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Text(
+                              tr(bn, "No recordings yet", "এখনো কোনো রেকর্ডিং নেই"),
+                              color = C.Muted, fontSize = 15.sp
+                          )
+                      }
+                  } else {
+                      LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                          items(videos, key = { it.uri.toString() }) { v ->
+                              VideoCard(v, bn) { toDelete = v }
+                          }
+                      }
+                  }
+              }
+
+              val d = toDelete
+              if (d != null) {
+                  AlertDialog(
+                      onDismissRequest = { toDelete = null },
+                      containerColor = C.Card,
+                      title = { Text(tr(bn, "Delete recording?", "রেকর্ডিং ডিলিট করবেন?"), color = C.Text) },
+                      text = { Text(d.name, color = C.Muted) },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              try {
+                                  ctx.contentResolver.delete(d.uri, null, null)
+                              } catch (e: Exception) {
+                                  Toast.makeText(ctx, "Cannot delete", Toast.LENGTH_SHORT).show()
+                              }
+                              toDelete = null
+                              tick += 1
+                          }) { Text(tr(bn, "Delete", "ডিলিট"), color = C.Accent) }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { toDelete = null }) { Text(tr(bn, "Cancel", "বাতিল"), color = C.Muted) }
+                      }
+                  )
+              }
+          }
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/res/drawable/ic_launcher_fg.xml <<'KTEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFFF3B5C"
+                  android:pathData="M54,54m-20,0a20,20 0 1,0 40,0a20,20 0 1,0 -40,0" />
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="4"
+                  android:pathData="M54,54m-30,0a30,30 0 1,0 60,0a30,30 0 1,0 -60,0" />
+          </vector>
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/res/drawable/ic_stat.xml <<'KTEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,12m-6,0a6,6 0 1,0 12,0a6,6 0 1,0 -12,0" />
+          </vector>
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'KTEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_fg" />
+          </adaptive-icon>
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/res/values/colors.xml <<'KTEOF'
+          <resources>
+              <color name="bg">#FF0B0F1A</color>
+              <color name="surface">#FF141B2D</color>
+              <color name="ic_bg">#FF141B2D</color>
+          </resources>
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/res/values/strings.xml <<'KTEOF'
+          <resources>
+              <string name="app_name">Screen Recorder Pro</string>
+          </resources>
+          KTEOF
+          cat > ScreenRecorderPro/app/src/main/res/values/themes.xml <<'KTEOF'
+          <resources>
+              <style name="Theme.App" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:navigationBarColor">@color/surface</item>
+              </style>
+          </resources>
+          KTEOF
+          cat > ScreenRecorderPro/build.gradle.kts <<'KTEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KTEOF
+          cat > ScreenRecorderPro/gradle.properties <<'KTEOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          KTEOF
+          cat > ScreenRecorderPro/settings.gradle.kts <<'KTEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ScreenRecorderPro"
+          include(":app")
+          KTEOF
+
+      - name: Build release APK
+        run: gradle -p ScreenRecorderPro :app:assembleRelease --stacktrace --no-daemon
+
+      - name: Rename APK
+        run: |
+          mkdir -p out
+          cp ScreenRecorderPro/app/build/outputs/apk/release/*.apk out/ScreenRecorderPro.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenRecorderPro-APK
+          path: out/ScreenRecorderPro.apk
+
+      - name: Publish release
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Screen Recorder Pro build ${{ github.run_number }}
+          files: out/ScreenRecorderPro.apk
